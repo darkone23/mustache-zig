@@ -1,3 +1,40 @@
+//! # Context Abstractions for Template Rendering
+//!
+//! ## Purpose
+//! This module provides the context abstraction layer that allows the rendering engine
+//! to work with different data sources (native Zig types, JSON values).
+//!
+//! ## Zig 0.15.2 Migration Changes
+//!
+//! ### FFI Removal
+//! The FFI context support has been removed. Previously supported three context types:
+//! - Native Zig types (structs, primitives, etc.)
+//! - JSON values (`std.json.Value`)
+//! - FFI user data (REMOVED)
+//!
+//! The FFI context was used for cross-language bindings (C, .NET) which have been
+//! removed from this version.
+//!
+//! ## Context Sources
+//!
+//! ### Native Context (`contexts/native/`)
+//! - Works with any Zig type
+//! - Supports structs, unions, primitives, slices, optionals, etc.
+//! - Full type information available at compile time
+//! - Most efficient for Zig-to-Zig templating
+//!
+//! ### JSON Context (`contexts/json/`)
+//! - Works with `std.json.Value` or `std.json.Parsed(std.json.Value)`
+//! - Runtime key-value lookup
+//! - Useful when template data comes from JSON sources
+//!
+//! ## Lambda Support
+//!
+//! Lambdas are supported in native contexts through the `LambdaContext` interface.
+//! See `contexts/native/lambda.zig` for implementation details.
+//!
+//! The critical bug fix for Zig 0.15.2 is documented in that file.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const meta = std.meta;
@@ -15,7 +52,6 @@ const ContextSource = rendering.ContextSource;
 
 const native_context = @import("contexts/native/context.zig");
 const json_context = @import("contexts/json/context.zig");
-const ffi_context = @import("contexts/ffi/context.zig");
 
 pub const Fields = @import("Fields.zig");
 
@@ -59,25 +95,21 @@ pub const Escape = enum {
 
 pub fn ContextType(
     comptime context_source: ContextSource,
-    comptime Writer: type,
     comptime PartialsMap: type,
     comptime options: RenderOptions,
 ) type {
-
     // The native context uses dynamic dispatch to resolve how to render each kind
     // of struct and data-type.
     // The json context uses static dispatch, once the JSON key-value is well known
     // for any possible type.
     return switch (context_source) {
-        .native => native_context.ContextInterfaceType(Writer, PartialsMap, options),
-        .json => json_context.ContextType(Writer, PartialsMap, options),
-        .ffi => ffi_context.ContextType(Writer, PartialsMap, options),
+        .native => native_context.ContextInterfaceType(PartialsMap, options),
+        .json => json_context.ContextType(PartialsMap, options),
     };
 }
 
 pub fn ContextImplType(
     comptime context_source: ContextSource,
-    comptime Writer: type,
     comptime Data: type,
     comptime PartialsMap: type,
     comptime options: RenderOptions,
@@ -91,9 +123,8 @@ pub fn ContextImplType(
     }
 
     return switch (context_source) {
-        .native => native_context.ContextImplType(Writer, Data, PartialsMap, options),
-        .json => json_context.ContextType(Writer, PartialsMap, options),
-        .ffi => ffi_context.ContextType(Writer, PartialsMap, options),
+        .native => native_context.ContextImplType(Data, PartialsMap, options),
+        .json => json_context.ContextType(PartialsMap, options),
     };
 }
 
@@ -275,14 +306,13 @@ pub const LambdaContext = struct {
     /// Can return anyerror depending on the underlying writer
     pub fn writeFormat(
         self: LambdaContext,
+        allocator: Allocator,
         comptime fmt: []const u8,
         args: anytype,
     ) anyerror!void {
-        const writer = std.io.Writer(LambdaContext, anyerror, writeFn){
-            .context = self,
-        };
-
-        try std.fmt.format(writer, fmt, args);
+        const formatted = try std.fmt.allocPrint(allocator, fmt, args);
+        defer allocator.free(formatted);
+        try self.write(formatted);
     }
 
     /// Writes the raw text on the output stream.
@@ -300,5 +330,4 @@ test {
     _ = Fields;
     _ = native_context;
     _ = json_context;
-    _ = ffi_context;
 }

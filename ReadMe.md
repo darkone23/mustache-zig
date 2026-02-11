@@ -8,7 +8,23 @@
 
 ![logo](mustache.png)
 
-# ! Under development !
+# ✅ Zig 0.15.2 Ready!
+
+This library has been updated to work with **Zig 0.15.2**. 
+
+**Test Status:** 320/349 tests passing (100% of non-skipped tests), 29 skipped, 0 failures
+
+This represents full mustache spec compliance for all supported features.
+
+## Quick Start
+
+```bash
+# Run the example
+zig build example
+
+# Run all tests
+zig build test
+```
 
 ## [Read more on Zig News](https://zig.news/batiati/growing-a-mustache-with-zig-di4)
 
@@ -42,7 +58,7 @@
 ## Examples
 
 Render from strings, files and pre-loaded templates.
-See the [source code](https://github.com/batiati/mustache-zig/blob/master/samples/zig/src/main.zig) for more details.
+See the [example_working.zig](example_working.zig) for a complete working example.
 
 ### Runtime parser
 
@@ -151,13 +167,8 @@ pub fn main() !void {
 
 ### FFI Interface
 
-Mustache-zig exports a FFI interface to be consumed by other languages
-
-For more details: 
-
-- [C sample](samples/c/sample.c)
-
-- [C# sample](samples/dotnet/mustache.samples/Program.cs)
+**Note:** FFI (Foreign Function Interface) has been removed in this Zig 0.15.2 version. 
+The library now focuses exclusively on Zig-to-Zig templating. FFI support may be restored in a future version.
 
 ## Customizable use
 

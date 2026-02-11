@@ -23,13 +23,12 @@ const ContextIteratorType = context.ContextIteratorType;
 /// This struct implements the expected context interface using static dispatch.
 /// Pub functions must be kept in sync with other contexts implementation
 pub fn ContextType(
-    comptime Writer: type,
     comptime PartialsMap: type,
     comptime options: RenderOptions,
 ) type {
+    const Writer = std.Io.Writer;
     const RenderEngine = rendering.RenderEngineType(
         .json,
-        Writer,
         PartialsMap,
         options,
     );

@@ -24,13 +24,12 @@ const lambda = @import("lambda.zig");
 const LambdaInvokerType = lambda.LambdaInvokerType;
 
 pub fn InvokerType(
-    comptime Writer: type,
     comptime PartialsMap: type,
     comptime options: RenderOptions,
 ) type {
+    const Writer = std.Io.Writer;
     const RenderEngine = rendering.RenderEngineType(
         .native,
-        Writer,
         PartialsMap,
         options,
     );
@@ -459,7 +458,7 @@ pub fn InvokerType(
             const escape: Escape = params.@"2";
             const delimiters: Delimiters = params.@"3";
 
-            const Impl = lambda.LambdaContextImplType(Writer, PartialsMap, options);
+            const Impl = lambda.LambdaContextImplType(PartialsMap, options);
             var impl = Impl{
                 .data_render = data_render,
                 .escape = escape,

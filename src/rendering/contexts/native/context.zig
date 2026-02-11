@@ -1,3 +1,35 @@
+//! # Native Zig Context Implementation
+//!
+//! ## Purpose
+//! This module implements the context interface for native Zig types (structs,
+//! primitives, slices, etc.). It's the primary context for Zig-to-Zig templating.
+//!
+//! ## Zig 0.15.2 Migration Changes
+//!
+//! ### Writer VTable for Testing
+//! Created `array_list_writer_vtable` to allow `std.array_list.Managed(u8)` to be
+//! used as a `std.Io.Writer` in tests. This is necessary because:
+//!
+//! 1. Zig 0.15.2 uses `std.Io.Writer` (fat pointer with vtable)
+//! 2. ArrayList doesn't natively implement this interface
+//! 3. Tests need to capture output for verification
+//!
+//! The vtable provides:
+//! - `drain` - Appends bytes to the ArrayList
+//! - `flush` - No-op (ArrayList doesn't need flushing)
+//! - `rebase` - No-op
+//! - `sendFile` - Not implemented (tests don't use file I/O)
+//!
+//! ### Lambda Integration
+//! Integrates with `lambda.zig` to support callable template sections.
+//! The lambda bug fix in `lambda.zig` is critical for this to work.
+//!
+//! ## Type Erasure
+//!
+//! Uses `ErasedType` union to handle different data types uniformly during rendering.
+//! This allows the rendering engine to work with any user data type without knowing
+//! the concrete type at compile time.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
@@ -22,6 +54,50 @@ const rendering = @import("../../rendering.zig");
 const map = @import("../../partials_map.zig");
 const lambda = @import("lambda.zig");
 const invoker = @import("invoker.zig");
+const writer_compat = @import("../../../writer_compat.zig");
+
+// VTable for std.array_list.Managed(u8) to use as an Io.Writer
+const array_list_writer_vtable = std.Io.Writer.VTable{
+    .drain = struct {
+        fn drain(ctx: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const list: *std.array_list.Managed(u8) = @ptrCast(@alignCast(ctx.buffer));
+            var total: usize = 0;
+            for (data) |buf| {
+                list.appendSlice(buf) catch return error.WriteFailed;
+                total += buf.len;
+            }
+            if (splat > 1 and data.len > 0) {
+                const last = data[data.len - 1];
+                var i: usize = 1;
+                while (i < splat) : (i += 1) {
+                    list.appendSlice(last) catch return error.WriteFailed;
+                    total += last.len;
+                }
+            }
+            return total;
+        }
+    }.drain,
+    .flush = struct {
+        fn flush(ctx: *std.Io.Writer) std.Io.Writer.Error!void {
+            _ = ctx;
+        }
+    }.flush,
+    .rebase = struct {
+        fn rebase(ctx: *std.Io.Writer, preserve: usize, capacity: usize) std.Io.Writer.Error!void {
+            _ = ctx;
+            _ = preserve;
+            _ = capacity;
+        }
+    }.rebase,
+    .sendFile = struct {
+        fn sendFile(ctx: *std.Io.Writer, file_reader: *std.fs.File.Reader, limit: std.Io.Limit) std.Io.Writer.FileError!usize {
+            _ = ctx;
+            _ = file_reader;
+            _ = limit;
+            return error.Unimplemented;
+        }
+    }.sendFile,
+};
 
 /// This type is a type-erasure container
 /// It is large enough to hold primitives passed by value like pointers,
@@ -81,12 +157,12 @@ pub const ErasedType = struct {
 /// This struct implements the expected context interface using dynamic dispatch.
 /// Pub functions must be kept in sync with other contexts implementation
 pub fn ContextInterfaceType(
-    comptime Writer: type,
     comptime PartialsMap: type,
     comptime options: RenderOptions,
 ) type {
-    const RenderEngine = rendering.RenderEngineType(.native, Writer, PartialsMap, options);
+    const RenderEngine = rendering.RenderEngineType(.native, PartialsMap, options);
     const DataRender = RenderEngine.DataRender;
+    const Writer = std.Io.Writer;
 
     return struct {
         const ContextInterface = @This();
@@ -196,20 +272,19 @@ pub fn ContextInterfaceType(
 
 /// Implements the ContextInterface.VTable for the comptime-known data type.
 pub fn ContextImplType(
-    comptime Writer: type,
     comptime Data: type,
     comptime PartialsMap: type,
     comptime options: RenderOptions,
 ) type {
+    const Writer = std.Io.Writer;
     const RenderEngine = rendering.RenderEngineType(
         .native,
-        Writer,
         PartialsMap,
         options,
     );
     const Context = RenderEngine.Context;
     const DataRender = RenderEngine.DataRender;
-    const Invoker = invoker.InvokerType(Writer, PartialsMap, options);
+    const Invoker = invoker.InvokerType(PartialsMap, options);
 
     return struct {
         const is_zero_size = @sizeOf(Data) == 0;
@@ -335,16 +410,16 @@ const context_tests = struct {
         }
 
         pub fn selfLambda(self: Person, ctx: LambdaContext) !void {
-            try ctx.writeFormat("{}", .{self.name.len});
+            try ctx.writeFormat(testing.allocator, "{}", .{self.name.len});
         }
 
         pub fn selfConstPtrLambda(self: *const Person, ctx: LambdaContext) !void {
-            try ctx.writeFormat("{}", .{self.name.len});
+            try ctx.writeFormat(testing.allocator, "{}", .{self.name.len});
         }
 
         pub fn selfMutPtrLambda(self: *Person, ctx: LambdaContext) !void {
             self.counter += 1;
-            try ctx.writeFormat("{}", .{self.counter});
+            try ctx.writeFormat(testing.allocator, "{}", .{self.counter});
         }
 
         pub fn willFailStaticLambda(ctx: LambdaContext) error{Expected}!void {
@@ -422,8 +497,8 @@ const context_tests = struct {
 
     const dummy_options = RenderOptions{ .string = .{} };
     const DummyPartialsMap = map.PartialsMapType(void, dummy_options);
-    const DummyWriter = std.ArrayList(u8).Writer;
-    const DummyRenderEngine = rendering.RenderEngineType(.native, DummyWriter, DummyPartialsMap, dummy_options);
+    const DummyWriter = std.array_list.Managed(u8).Writer;
+    const DummyRenderEngine = rendering.RenderEngineType(.native, DummyPartialsMap, dummy_options);
 
     const parsing = @import("../../../parsing/parser.zig");
     const DummyParser = parsing.ParserType(.{ .source = .{ .string = .{ .copy_strings = false } }, .output = .render, .load_mode = .runtime_loaded });
@@ -442,7 +517,7 @@ const context_tests = struct {
 
         const ctx = DummyRenderEngine.getContextType(if (by_value) data else @as(*const Data, &data));
 
-        try interpolateCtx(writer, ctx, path, .unescaped);
+        try interpolateCtx(@constCast(&writer), ctx, path, .unescaped);
     }
 
     fn interpolateCtx(writer: anytype, ctx: DummyRenderEngine.Context, identifier: []const u8, escape: Escape) anyerror!void {
@@ -451,9 +526,10 @@ const context_tests = struct {
             .ctx = ctx,
         };
 
+        const any_writer = writer_compat.toAnyWriter(writer);
         var data_render = DummyRenderEngine.DataRender{
             .stack = &stack,
-            .out_writer = .{ .writer = writer },
+            .out_writer = .{ .writer = any_writer },
             .partials_map = undefined,
             .indentation_queue = undefined,
             .template_options = {},
@@ -472,13 +548,17 @@ const context_tests = struct {
 
     test "Write Int" {
         const allocator = testing.allocator;
-        var list = std.ArrayList(u8).init(allocator);
+        var list = std.array_list.Managed(u8).init(allocator);
         defer list.deinit();
 
         var person = getPerson();
         defer if (person.indication) |indication| allocator.destroy(indication);
 
-        const writer = list.writer();
+        const writer = std.Io.Writer{
+            .vtable = &array_list_writer_vtable,
+            .buffer = @ptrCast(&list),
+            .end = @sizeOf(@TypeOf(list)),
+        };
 
         // Direct access
         try interpolate(writer, person, "id");
@@ -517,13 +597,17 @@ const context_tests = struct {
 
     test "Write Float" {
         const allocator = testing.allocator;
-        var list = std.ArrayList(u8).init(allocator);
+        var list = std.array_list.Managed(u8).init(allocator);
         defer list.deinit();
 
         var person = getPerson();
         defer if (person.indication) |indication| allocator.destroy(indication);
 
-        const writer = list.writer();
+        const writer = std.Io.Writer{
+            .vtable = &array_list_writer_vtable,
+            .buffer = @ptrCast(&list),
+            .end = @sizeOf(@TypeOf(list)),
+        };
 
         // Direct access
         try interpolate(writer, person, "salary");
@@ -574,13 +658,17 @@ const context_tests = struct {
 
     test "Write String" {
         const allocator = testing.allocator;
-        var list = std.ArrayList(u8).init(allocator);
+        var list = std.array_list.Managed(u8).init(allocator);
         defer list.deinit();
 
         var person = getPerson();
         defer if (person.indication) |indication| allocator.destroy(indication);
 
-        const writer = list.writer();
+        const writer = std.Io.Writer{
+            .vtable = &array_list_writer_vtable,
+            .buffer = @ptrCast(&list),
+            .end = @sizeOf(@TypeOf(list)),
+        };
 
         // Direct access
         try interpolate(writer, person, "name");
@@ -631,13 +719,17 @@ const context_tests = struct {
 
     test "Write Enum" {
         const allocator = testing.allocator;
-        var list = std.ArrayList(u8).init(allocator);
+        var list = std.array_list.Managed(u8).init(allocator);
         defer list.deinit();
 
         var person = getPerson();
         defer if (person.indication) |indication| allocator.destroy(indication);
 
-        const writer = list.writer();
+        const writer = std.Io.Writer{
+            .vtable = &array_list_writer_vtable,
+            .buffer = @ptrCast(&list),
+            .end = @sizeOf(@TypeOf(list)),
+        };
 
         // Direct access
         try interpolate(writer, person, "address.region");
@@ -664,13 +756,17 @@ const context_tests = struct {
 
     test "Write Bool" {
         const allocator = testing.allocator;
-        var list = std.ArrayList(u8).init(allocator);
+        var list = std.array_list.Managed(u8).init(allocator);
         defer list.deinit();
 
         var person = getPerson();
         defer if (person.indication) |indication| allocator.destroy(indication);
 
-        const writer = list.writer();
+        const writer = std.Io.Writer{
+            .vtable = &array_list_writer_vtable,
+            .buffer = @ptrCast(&list),
+            .end = @sizeOf(@TypeOf(list)),
+        };
 
         // Direct access
         try interpolate(writer, person, "active");
@@ -697,13 +793,17 @@ const context_tests = struct {
 
     test "Write Nullable" {
         const allocator = testing.allocator;
-        var list = std.ArrayList(u8).init(allocator);
+        var list = std.array_list.Managed(u8).init(allocator);
         defer list.deinit();
 
         var person = getPerson();
         defer if (person.indication) |indication| allocator.destroy(indication);
 
-        const writer = list.writer();
+        const writer = std.Io.Writer{
+            .vtable = &array_list_writer_vtable,
+            .buffer = @ptrCast(&list),
+            .end = @sizeOf(@TypeOf(list)),
+        };
 
         // Direct access
         try interpolate(writer, person, "additional_information");
@@ -742,13 +842,17 @@ const context_tests = struct {
 
     test "Write Not found" {
         const allocator = testing.allocator;
-        var list = std.ArrayList(u8).init(allocator);
+        var list = std.array_list.Managed(u8).init(allocator);
         defer list.deinit();
 
         var person = getPerson();
         defer if (person.indication) |indication| allocator.destroy(indication);
 
-        const writer = list.writer();
+        const writer = std.Io.Writer{
+            .vtable = &array_list_writer_vtable,
+            .buffer = @ptrCast(&list),
+            .end = @sizeOf(@TypeOf(list)),
+        };
 
         // Direct access
         try interpolate(writer, person, "wrong_name");
@@ -769,13 +873,17 @@ const context_tests = struct {
 
     test "Lambda - staticLambda" {
         const allocator = testing.allocator;
-        var list = std.ArrayList(u8).init(allocator);
+        var list = std.array_list.Managed(u8).init(allocator);
         defer list.deinit();
 
         var person = getPerson();
         defer if (person.indication) |indication| allocator.destroy(indication);
 
-        const writer = list.writer();
+        const writer = std.Io.Writer{
+            .vtable = &array_list_writer_vtable,
+            .buffer = @ptrCast(&list),
+            .end = @sizeOf(@TypeOf(list)),
+        };
 
         // Direct access
         try interpolate(writer, person, "staticLambda");
@@ -810,13 +918,17 @@ const context_tests = struct {
 
     test "Lambda - selfLambda" {
         const allocator = testing.allocator;
-        var list = std.ArrayList(u8).init(allocator);
+        var list = std.array_list.Managed(u8).init(allocator);
         defer list.deinit();
 
         var person = getPerson();
         defer if (person.indication) |indication| allocator.destroy(indication);
 
-        const writer = list.writer();
+        const writer = std.Io.Writer{
+            .vtable = &array_list_writer_vtable,
+            .buffer = @ptrCast(&list),
+            .end = @sizeOf(@TypeOf(list)),
+        };
 
         // Direct access
         try interpolate(writer, person, "selfLambda");
@@ -851,7 +963,7 @@ const context_tests = struct {
 
     test "Lambda - selfConstPtrLambda" {
         const allocator = testing.allocator;
-        var list = std.ArrayList(u8).init(allocator);
+        var list = std.array_list.Managed(u8).init(allocator);
         defer list.deinit();
 
         var person = getPerson();
@@ -860,7 +972,11 @@ const context_tests = struct {
         const person_const_ptr: *const Person = &person;
         const person_ptr: *Person = &person;
 
-        const writer = list.writer();
+        const writer = std.Io.Writer{
+            .vtable = &array_list_writer_vtable,
+            .buffer = @ptrCast(&list),
+            .end = @sizeOf(@TypeOf(list)),
+        };
 
         // Direct access
         try interpolate(writer, person, "selfConstPtrLambda");
@@ -902,10 +1018,14 @@ const context_tests = struct {
 
     test "Lambda - Write selfMutPtrLambda" {
         const allocator = testing.allocator;
-        var list = std.ArrayList(u8).init(allocator);
+        var list = std.array_list.Managed(u8).init(allocator);
         defer list.deinit();
 
-        const writer = list.writer();
+        const writer = std.Io.Writer{
+            .vtable = &array_list_writer_vtable,
+            .buffer = @ptrCast(&list),
+            .end = @sizeOf(@TypeOf(list)),
+        };
 
         {
             const person = getPerson();
@@ -977,13 +1097,17 @@ const context_tests = struct {
 
     test "Lambda - error handling" {
         const allocator = testing.allocator;
-        var list = std.ArrayList(u8).init(allocator);
+        var list = std.array_list.Managed(u8).init(allocator);
         defer list.deinit();
 
         const person = getPerson();
         defer if (person.indication) |indication| allocator.destroy(indication);
 
-        const writer = list.writer();
+        const writer = std.Io.Writer{
+            .vtable = &array_list_writer_vtable,
+            .buffer = @ptrCast(&list),
+            .end = @sizeOf(@TypeOf(list)),
+        };
 
         try interpolate(writer, person, "willFailStaticLambda");
         try testing.expectEqualStrings("", list.items);
@@ -998,13 +1122,17 @@ const context_tests = struct {
 
     test "Lambda - Write invalid functions" {
         const allocator = testing.allocator;
-        var list = std.ArrayList(u8).init(allocator);
+        var list = std.array_list.Managed(u8).init(allocator);
         defer list.deinit();
 
         const person = getPerson();
         defer if (person.indication) |indication| allocator.destroy(indication);
 
-        const writer = list.writer();
+        const writer = std.Io.Writer{
+            .vtable = &array_list_writer_vtable,
+            .buffer = @ptrCast(&list),
+            .end = @sizeOf(@TypeOf(list)),
+        };
 
         // Unexpected arguments
         try interpolate(writer, person, "anythingElse");
@@ -1015,13 +1143,17 @@ const context_tests = struct {
 
     test "Navigation" {
         const allocator = testing.allocator;
-        var list = std.ArrayList(u8).init(allocator);
+        var list = std.array_list.Managed(u8).init(allocator);
         defer list.deinit();
 
         var person = getPerson();
         defer if (person.indication) |indication| allocator.destroy(indication);
 
-        const writer = list.writer();
+        const writer = std.Io.Writer{
+            .vtable = &array_list_writer_vtable,
+            .buffer = @ptrCast(&list),
+            .end = @sizeOf(@TypeOf(list)),
+        };
 
         // Person
 
@@ -1030,7 +1162,7 @@ const context_tests = struct {
         {
             list.clearAndFree();
 
-            try interpolateCtx(writer, person_ctx, "address.street", .unescaped);
+            try interpolateCtx(@constCast(&writer), person_ctx, "address.street", .unescaped);
             try testing.expectEqualStrings("nearby", list.items);
         }
 
@@ -1052,7 +1184,7 @@ const context_tests = struct {
         {
             list.clearAndFree();
 
-            try interpolateCtx(writer, address_ctx, "street", .unescaped);
+            try interpolateCtx(@constCast(&writer), address_ctx, "street", .unescaped);
             try testing.expectEqualStrings("nearby", list.items);
         }
 
@@ -1074,27 +1206,31 @@ const context_tests = struct {
         {
             list.clearAndFree();
 
-            try interpolateCtx(writer, street_ctx, "", .unescaped);
+            try interpolateCtx(@constCast(&writer), street_ctx, "", .unescaped);
             try testing.expectEqualStrings("nearby", list.items);
         }
 
         {
             list.clearAndFree();
 
-            try interpolateCtx(writer, street_ctx, ".", .unescaped);
+            try interpolateCtx(@constCast(&writer), street_ctx, ".", .unescaped);
             try testing.expectEqualStrings("nearby", list.items);
         }
     }
 
     test "Navigation Pointers" {
         const allocator = testing.allocator;
-        var list = std.ArrayList(u8).init(allocator);
+        var list = std.array_list.Managed(u8).init(allocator);
         defer list.deinit();
 
         var person = getPerson();
         defer if (person.indication) |indication| allocator.destroy(indication);
 
-        const writer = list.writer();
+        const writer = std.Io.Writer{
+            .vtable = &array_list_writer_vtable,
+            .buffer = @ptrCast(&list),
+            .end = @sizeOf(@TypeOf(list)),
+        };
 
         // Person
 
@@ -1103,7 +1239,7 @@ const context_tests = struct {
         {
             list.clearAndFree();
 
-            try interpolateCtx(writer, person_ctx, "indication.address.street", .unescaped);
+            try interpolateCtx(@constCast(&writer), person_ctx, "indication.address.street", .unescaped);
             try testing.expectEqualStrings("far away street", list.items);
         }
 
@@ -1125,7 +1261,7 @@ const context_tests = struct {
         {
             list.clearAndFree();
 
-            try interpolateCtx(writer, indication_ctx, "address.street", .unescaped);
+            try interpolateCtx(@constCast(&writer), indication_ctx, "address.street", .unescaped);
             try testing.expectEqualStrings("far away street", list.items);
         }
 
@@ -1147,7 +1283,7 @@ const context_tests = struct {
         {
             list.clearAndFree();
 
-            try interpolateCtx(writer, address_ctx, "street", .unescaped);
+            try interpolateCtx(@constCast(&writer), address_ctx, "street", .unescaped);
             try testing.expectEqualStrings("far away street", list.items);
         }
 
@@ -1169,14 +1305,14 @@ const context_tests = struct {
         {
             list.clearAndFree();
 
-            try interpolateCtx(writer, street_ctx, "", .unescaped);
+            try interpolateCtx(@constCast(&writer), street_ctx, "", .unescaped);
             try testing.expectEqualStrings("far away street", list.items);
         }
 
         {
             list.clearAndFree();
 
-            try interpolateCtx(writer, street_ctx, ".", .unescaped);
+            try interpolateCtx(@constCast(&writer), street_ctx, ".", .unescaped);
             try testing.expectEqualStrings("far away street", list.items);
         }
     }
@@ -1259,13 +1395,18 @@ const context_tests = struct {
 
     test "Iterator over slice" {
         const allocator = testing.allocator;
-        var list = std.ArrayList(u8).init(allocator);
+        var list = std.array_list.Managed(u8).init(allocator);
         defer list.deinit();
 
         var person = getPerson();
         defer if (person.indication) |indication| allocator.destroy(indication);
 
-        const writer = list.writer();
+        // Create an Io.Writer from the array list
+        const writer = std.Io.Writer{
+            .vtable = &array_list_writer_vtable,
+            .buffer = @ptrCast(&list),
+            .end = @sizeOf(@TypeOf(list)),
+        };
 
         // Person
         var ctx = DummyRenderEngine.getContextType(&person);
@@ -1288,7 +1429,7 @@ const context_tests = struct {
 
         list.clearAndFree();
 
-        try interpolateCtx(writer, item_1, "name", .unescaped);
+        try interpolateCtx(@constCast(&writer), item_1, "name", .unescaped);
         try testing.expectEqualStrings("item 1", list.items);
 
         const item_2 = iterator.next() orelse {
@@ -1298,7 +1439,7 @@ const context_tests = struct {
 
         list.clearAndFree();
 
-        try interpolateCtx(writer, item_2, "name", .unescaped);
+        try interpolateCtx(@constCast(&writer), item_2, "name", .unescaped);
         try testing.expectEqualStrings("item 2", list.items);
 
         const no_more = iterator.next();

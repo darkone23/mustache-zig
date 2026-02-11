@@ -1,3 +1,44 @@
+//! # Lambda Implementation for Mustache-Zig
+//!
+//! ## Purpose
+//! This module implements lambda (callable template sections) support for the mustache template
+//! engine. Lambdas allow dynamic content generation during template rendering.
+//!
+//! ## Critical Bug Fix (Zig 0.15.2 Migration)
+//!
+//! **Problem:** During the Zig 0.15.2 migration, lambdas were producing empty output.
+//!
+//! **Root Cause:** In the `write()` function (line 92-95), the code was calling `countWrite()`
+//! instead of `write()`. The `countWrite()` function creates a CountingWriter that only counts
+//! bytes without actually writing them to the output. This meant all lambda-generated content
+//! was being counted but discarded.
+//!
+//! **Solution:** Changed the implementation to call `self.data_render.write()` which actually
+//! writes content to the output writer, then returns the length of the written text.
+//!
+//! ## Architecture
+//!
+//! The lambda system works through three main functions:
+//! 1. **renderAlloc** - Renders a template string and returns it as a newly allocated string
+//! 2. **render** - Renders a template string directly to the current output
+//! 3. **write** - Writes raw text to the output (THE CRITICAL FIX LOCATION)
+//!
+//! ## Usage Example
+//! ```zig
+//! const Data = struct {
+//!     name: []const u8,
+//!
+//!     // Lambda that converts text to uppercase
+//!     pub fn upper(ctx: mustache.LambdaContext) !void {
+//!         const text = try ctx.renderAlloc(allocator, ctx.inner_text);
+//!         defer allocator.free(text);
+//!
+//!         // Convert to uppercase...
+//!         try ctx.write(upper_text);  // This now works!
+//!     }
+//! };
+//! ```
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const meta = std.meta;
@@ -17,10 +58,17 @@ const LambdaContext = context.LambdaContext;
 
 const rendering = @import("../../rendering.zig");
 
-pub fn LambdaContextImplType(comptime Writer: type, comptime PartialsMap: type, comptime options: RenderOptions) type {
+/// Creates a lambda context implementation for the native Zig context
+///
+/// Type Parameters:
+///   - PartialsMap: Type handling partial template lookups
+///   - options: Compile-time rendering options
+///
+/// Returns: A struct type that implements the LambdaContext interface
+pub fn LambdaContextImplType(comptime PartialsMap: type, comptime options: RenderOptions) type {
+    // Get the rendering engine type configured for native Zig contexts
     const RenderEngine = rendering.RenderEngineType(
         .native,
-        Writer,
         PartialsMap,
         options,
     );
@@ -29,16 +77,21 @@ pub fn LambdaContextImplType(comptime Writer: type, comptime PartialsMap: type, 
     return struct {
         const Self = @This();
 
+        /// Reference to the current data render state
         data_render: *DataRender,
+        /// Whether to HTML-escape the output
         escape: Escape,
+        /// Current delimiter configuration (e.g., "{{" and "}}")
         delimiters: Delimiters,
 
+        // Vtable implementing the LambdaContext interface
         const vtable = LambdaContext.VTable{
             .renderAlloc = renderAlloc,
             .render = render,
             .write = write,
         };
 
+        /// Creates a LambdaContext interface instance for this implementation
         pub fn ContextType(self: *Self, inner_text: []const u8) LambdaContext {
             return .{
                 .ptr = self,
@@ -47,45 +100,94 @@ pub fn LambdaContextImplType(comptime Writer: type, comptime PartialsMap: type, 
             };
         }
 
+        /// Renders a template string and returns the result as a newly allocated string
+        ///
+        /// This is useful when a lambda needs to process the rendered content before outputting it.
+        /// For example, converting to uppercase, adding markdown, etc.
         fn renderAlloc(ctx: *const anyopaque, allocator: Allocator, template_text: []const u8) anyerror![]u8 {
             var self = getSelf(ctx);
 
+            // Parse the template text provided by the lambda
             var template = switch (try mustache.parseText(allocator, template_text, self.delimiters, .{ .copy_strings = false })) {
                 .success => |value| value,
                 .parse_error => |detail| return detail.parse_error,
             };
             defer template.deinit(allocator);
 
+            // Save the current output writer
             const out_writer = self.data_render.out_writer;
-            var list = std.ArrayList(u8).init(allocator);
-            self.data_render.out_writer = .{ .buffer = list.writer() };
 
+            // Create a buffer to capture the rendered output
+            var buffer_writer = std.Io.Writer.Allocating.init(allocator);
+            self.data_render.out_writer = .{ .buffer = &buffer_writer.writer };
+
+            // Restore the original output writer and cleanup buffer when done
             defer {
                 self.data_render.out_writer = out_writer;
-                list.deinit();
+                buffer_writer.deinit();
             }
 
+            // Render the template elements into the buffer
             try self.data_render.render(template.elements);
-            return list.toOwnedSlice();
+
+            // Convert the buffer to a string and return it
+            var list = buffer_writer.toArrayList();
+            return list.toOwnedSlice(allocator);
         }
 
+        /// Renders a template string directly to the current output
+        ///
+        /// This is more efficient than renderAlloc when you don't need to process
+        /// the rendered content before outputting.
         fn render(ctx: *const anyopaque, allocator: Allocator, template_text: []const u8) anyerror!void {
             var self = getSelf(ctx);
 
+            // Parse the template text
             var template = switch (try mustache.parseText(allocator, template_text, self.delimiters, .{ .copy_strings = false })) {
                 .success => |value| value,
-                .parse_error => return,
+                .parse_error => return, // Silent fail on parse error
             };
             defer template.deinit(allocator);
 
+            // Render directly to the current output writer
             try self.data_render.render(template.elements);
         }
 
+        /// ## CRITICAL BUG FIX (Zig 0.15.2 Migration)
+        ///
+        /// This function was the source of the lambda empty output bug.
+        ///
+        /// **OLD (BROKEN) CODE:**
+        /// ```zig
+        /// fn write(ctx: *const anyopaque, rendered_text: []const u8) anyerror!usize {
+        ///     var self = getSelf(ctx);
+        ///     return try self.data_render.countWrite(rendered_text, self.escape);
+        /// }
+        /// ```
+        /// Problem: `countWrite()` only counts bytes, doesn't actually write them!
+        ///
+        /// **NEW (FIXED) CODE:**
+        /// ```zig
+        /// fn write(ctx: *const anyopaque, rendered_text: []const u8) anyerror!usize {
+        ///     var self = getSelf(ctx);
+        ///     try self.data_render.write(rendered_text, self.escape);
+        ///     return rendered_text.len;
+        /// }
+        /// ```
+        /// Solution: Call `write()` which actually writes content, then return the length.
+        ///
+        /// Writes raw text to the output with optional HTML escaping
+        ///
+        /// This is the function that lambdas call to output their generated content.
+        /// It applies the configured escape setting (HTML escaping or raw output).
         fn write(ctx: *const anyopaque, rendered_text: []const u8) anyerror!usize {
             var self = getSelf(ctx);
-            return try self.data_render.countWrite(rendered_text, self.escape);
+            // CRITICAL FIX: Call write() to actually write content, not countWrite()
+            try self.data_render.write(rendered_text, self.escape);
+            return rendered_text.len;
         }
 
+        /// Helper to convert the opaque context pointer to a typed Self pointer
         inline fn getSelf(ctx: *const anyopaque) *const Self {
             return @ptrCast(@alignCast(ctx));
         }
@@ -93,6 +195,9 @@ pub fn LambdaContextImplType(comptime Writer: type, comptime PartialsMap: type, 
 }
 
 /// Returns true if TValue is a type generated by LambdaInvokerType(...)
+///
+/// This is used to detect if a field in user data is a lambda that should be
+/// invoked during template rendering.
 pub fn isLambdaInvoker(comptime TValue: type) bool {
     if (comptime stdx.isSingleItemPtr(TValue)) {
         return isLambdaInvoker(meta.Child(TValue));
@@ -101,12 +206,12 @@ pub fn isLambdaInvoker(comptime TValue: type) bool {
             @hasField(TValue, "data") and
             @hasField(TValue, "bound_fn") and
             blk: {
-            const TFn = meta.Child(meta.fieldInfo(TValue, .bound_fn).type);
-            const TData = meta.fieldInfo(TValue, .data).type;
+                const TFn = meta.Child(meta.fieldInfo(TValue, .bound_fn).type);
+                const TData = meta.fieldInfo(TValue, .data).type;
 
-            break :blk comptime isValidLambdaFunction(TData, TFn) and
-                TValue == LambdaInvokerType(TData, TFn);
-        };
+                break :blk comptime isValidLambdaFunction(TData, TFn) and
+                    TValue == LambdaInvokerType(TData, TFn);
+            };
     }
 }
 
@@ -127,11 +232,14 @@ test "isLambdaInvoker" {
     try testing.expect(isLambdaInvoker(u32) == false);
 }
 
-/// Returns true if TFn is a function of one of the signatures:
-/// fn (LambdaContext) anyerror!void
-/// fn (TData, LambdaContext) anyerror!void
-/// fn (*const TData, LambdaContext) anyerror!void
-/// fn (*TData, LambdaContext) anyerror!void
+/// Returns true if TFn is a valid lambda function with one of these signatures:
+/// - fn (LambdaContext) anyerror!void
+/// - fn (TData, LambdaContext) anyerror!void
+/// - fn (*const TData, LambdaContext) anyerror!void
+/// - fn (*TData, LambdaContext) anyerror!void
+///
+/// Lambdas must return void (or void wrapped in an error union) because they
+/// output content via the LambdaContext.write() method, not via return value.
 pub fn isValidLambdaFunction(comptime TData: type, comptime TFn: type) bool {
     const fn_info = switch (@typeInfo(TFn)) {
         .@"fn" => |info| info,
@@ -165,9 +273,9 @@ pub fn isValidLambdaFunction(comptime TData: type, comptime TFn: type) bool {
             &.{ TValue, *const TValue, *TValue },
         ) and
             paramIs(
-            fn_info.params[1],
-            &.{LambdaContext},
-        ),
+                fn_info.params[1],
+                &.{LambdaContext},
+            ),
         else => false,
     };
 
@@ -247,6 +355,10 @@ test "isValidLambdaFunction" {
     try testing.expect(isValidLambdaFunction(signatures.Self, signatures.invalid_args_8) == false);
 }
 
+/// Creates a lambda invoker that binds a function pointer with data
+///
+/// This allows lambdas to be methods on user data structs. The invoker handles
+/// calling the function with the correct arguments based on its signature.
 pub fn LambdaInvokerType(comptime TData: type, comptime TFn: type) type {
     return struct {
         const Self = @This();

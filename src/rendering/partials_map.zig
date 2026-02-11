@@ -26,24 +26,19 @@ pub fn PartialsMapType(comptime TPartials: type, comptime comptime_options: Rend
         allocator: if (options != .template and !isEmpty()) Allocator else void,
         partials: TPartials,
 
-        pub usingnamespace switch (options) {
-            .template => struct {
-                pub fn init(partials: TPartials) PartialsMap {
-                    return .{
-                        .allocator = {},
-                        .partials = partials,
-                    };
-                }
-            },
-            .string, .file => struct {
-                pub fn init(allocator: Allocator, partials: TPartials) PartialsMap {
-                    return .{
-                        .allocator = if (comptime isEmpty()) {} else allocator,
-                        .partials = partials,
-                    };
-                }
-            },
-        };
+        pub fn init(partials: TPartials) PartialsMap {
+            return .{
+                .allocator = if (comptime options != .template and !isEmpty()) @compileError("init() requires an allocator for this configuration, use initWithAllocator()") else {},
+                .partials = partials,
+            };
+        }
+
+        pub fn initWithAllocator(allocator: Allocator, partials: TPartials) PartialsMap {
+            return .{
+                .allocator = if (comptime isEmpty()) {} else allocator,
+                .partials = partials,
+            };
+        }
 
         pub fn isEmpty() bool {
             return switch (@typeInfo(TPartials)) {
@@ -172,7 +167,7 @@ pub fn PartialsMapType(comptime TPartials: type, comptime comptime_options: Rend
                         const kv: KV = undefined;
                         return stdx.isZigString(@TypeOf(kv.key)) and
                             (@TypeOf(kv.value) == PartialsMap.Template or
-                            (stdx.isZigString(@TypeOf(kv.value)) and stdx.isZigString(PartialsMap.Template)));
+                                (stdx.isZigString(@TypeOf(kv.value)) and stdx.isZigString(PartialsMap.Template)));
                     }
                 }
 
@@ -189,7 +184,7 @@ test "Map single tuple" {
 
     const dummy_options = RenderOptions{ .string = .{} };
     const DummyMap = PartialsMapType(@TypeOf(data), dummy_options);
-    var map = DummyMap.init(testing.allocator, data);
+    var map = DummyMap.initWithAllocator(testing.allocator, data);
 
     const hello = map.get("hello");
     try testing.expect(hello != null);
@@ -203,7 +198,7 @@ test "Map single tuple - comptime value" {
 
     const dummy_options = RenderOptions{ .string = .{} };
     const DummyMap = PartialsMapType(@TypeOf(data), dummy_options);
-    var map = DummyMap.init(testing.allocator, data);
+    var map = DummyMap.initWithAllocator(testing.allocator, data);
 
     const hello = map.get("hello");
     try testing.expect(hello != null);
@@ -216,7 +211,7 @@ test "Map empty tuple" {
     const data = .{};
     const dummy_options = RenderOptions{ .string = .{} };
     const DummyMap = PartialsMapType(@TypeOf(data), dummy_options);
-    var map = DummyMap.init(testing.allocator, data);
+    var map = DummyMap.init(data);
     try testing.expect(map.get("wrong") == null);
 }
 
@@ -224,7 +219,7 @@ test "Map void" {
     const data = {};
     const dummy_options = RenderOptions{ .string = .{} };
     const DummyMap = PartialsMapType(@TypeOf(data), dummy_options);
-    var map = DummyMap.init(testing.allocator, data);
+    var map = DummyMap.init(data);
     try testing.expect(map.get("wrong") == null);
 }
 
@@ -238,7 +233,7 @@ test "Map multiple tuple" {
 
     const dummy_options = RenderOptions{ .string = .{} };
     const DummyMap = PartialsMapType(@TypeOf(data), dummy_options);
-    var map = DummyMap.init(testing.allocator, data);
+    var map = DummyMap.initWithAllocator(testing.allocator, data);
 
     const hello = map.get("hello");
     try testing.expect(hello != null);
@@ -259,7 +254,7 @@ test "Map multiple tuple comptime" {
 
     const dummy_options = RenderOptions{ .string = .{} };
     const DummyMap = PartialsMapType(@TypeOf(data), dummy_options);
-    var map = DummyMap.init(testing.allocator, data);
+    var map = DummyMap.initWithAllocator(testing.allocator, data);
 
     const hello = map.get("hello");
     try testing.expect(hello != null);
@@ -280,7 +275,7 @@ test "Map array" {
 
     const dummy_options = RenderOptions{ .string = .{} };
     const DummyMap = PartialsMapType(@TypeOf(data), dummy_options);
-    var map = DummyMap.init(testing.allocator, data);
+    var map = DummyMap.initWithAllocator(testing.allocator, data);
 
     const hello = map.get("hello");
     try testing.expect(hello != null);
@@ -301,7 +296,7 @@ test "Map ref array" {
 
     const dummy_options = RenderOptions{ .string = .{} };
     const DummyMap = PartialsMapType(@TypeOf(data), dummy_options);
-    var map = DummyMap.init(testing.allocator, data);
+    var map = DummyMap.initWithAllocator(testing.allocator, data);
 
     const hello = map.get("hello");
     try testing.expect(hello != null);
@@ -323,7 +318,7 @@ test "Map slice" {
 
     const dummy_options = RenderOptions{ .string = .{} };
     const DummyMap = PartialsMapType(@TypeOf(data), dummy_options);
-    var map = DummyMap.init(testing.allocator, data);
+    var map = DummyMap.initWithAllocator(testing.allocator, data);
 
     const hello = map.get("hello");
     try testing.expect(hello != null);
@@ -345,7 +340,7 @@ test "Map hashmap" {
 
     const dummy_options = RenderOptions{ .string = .{} };
     const DummyMap = PartialsMapType(@TypeOf(data), dummy_options);
-    var map = DummyMap.init(testing.allocator, data);
+    var map = DummyMap.initWithAllocator(testing.allocator, data);
 
     const hello = map.get("hello");
     try testing.expect(hello != null);

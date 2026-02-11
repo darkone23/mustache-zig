@@ -1,3 +1,32 @@
+//! # Field Access Utilities
+//!
+//! ## Purpose
+//! This module provides utilities for accessing fields from user data structures
+//! during template rendering. It handles type introspection and field extraction.
+//!
+//! ## Zig 0.15.2 Migration Changes
+//!
+//! ### FFI Removal
+//! Removed support for FFI user data fields:
+//! - Previously had `is_ffi_userdata` check in `byValue()` function
+//! - FFI user data handling code removed
+//! - Now only handles native Zig types and JSON values
+//!
+//! ## Key Functions
+//!
+//! - `getField()` - Extracts a field value by name from a struct
+//! - `byValue()` - Determines if a type should be passed by value or reference
+//! - Field type introspection for mustache path resolution
+//!
+//! ## Type Categories
+//!
+//! The `byValue()` function categorizes types to optimize memory usage:
+//! - Zero-sized types (always pass by value)
+//! - Pointers and slices (pass by value - they're just addresses)
+//! - JSON values (special handling)
+//! - Lambda invokers (passed by value for efficiency)
+//! - Small primitive types (ints, enums, bools)
+
 const std = @import("std");
 const meta = std.meta;
 
@@ -14,8 +43,6 @@ const context = @import("context.zig");
 const lambda = @import("contexts/native/lambda.zig");
 const native_context = @import("contexts/native/context.zig");
 const ErasedType = native_context.ErasedType;
-
-const extern_types = @import("../ffi/extern_types.zig");
 
 pub inline fn getField(data: anytype, comptime field_name: []const u8) field_type: {
     const Data = @TypeOf(data);
@@ -203,18 +230,16 @@ pub fn byValue(comptime TField: type) bool {
 
         const is_json = TField == std.json.Value;
 
-        const is_ffi_userdata = TField == extern_types.UserData;
-
         const is_lambda_invoker = size <= max_size and lambda.isLambdaInvoker(TField);
 
         const can_embed = size <= max_size and
             switch (@typeInfo(TField)) {
-            .@"enum", .enum_literal, .bool, .int, .float => true,
-            .optional => |info| byValue(info.child),
-            else => false,
-        };
+                .@"enum", .enum_literal, .bool, .int, .float => true,
+                .optional => |info| byValue(info.child),
+                else => false,
+            };
 
-        return is_json or is_ffi_userdata or is_zero_size or is_pointer or is_lambda_invoker or can_embed;
+        return is_json or is_zero_size or is_pointer or is_lambda_invoker or can_embed;
     }
 }
 
